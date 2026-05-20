@@ -488,4 +488,5 @@ for line in inChart.split('\n'):
                         simulate_slide(time, n, current_bpm)
                     )
             time += Fraction(4, div)
+outChart['judgeLineList'][0]['numOfNotes'] = len(outChart['judgeLineList'][0]['notes'])
 with open('chart.json','w') as f: dump(outChart,f)

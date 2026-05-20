@@ -337,124 +337,299 @@ def remove_bracket_content(s):
     return out
 
 
-def find_slide_start_end(part, inherit_start=None):
+def parse_slide_time_content(content, current_bpm):
     """
-    找 slide 起点和终点。
-    不用 re。
-
-    例如：
-    1-5[8:1]   -> 1 到 5
-    6<4[16:3]  -> 6 到 4
-    8w4[8:1]   -> 8 到 4
-    <7[8:1]    -> 如果 inherit_start 有值，就从 inherit_start 到 7
+    解析 [...] 内部内容，返回 delay, duration。
+    delay 只用于整条 SLIDE 开始前等待；连锁 SLIDE 的后续分段不再重复等待。
     """
-    s = remove_bracket_content(part)
-    s = s.translate(str.maketrans('', '', 'xbf@$?'))
+    content = content.strip()
 
-    start = None
-    start_pos = -1
+    if not content:
+        return Fraction(1), Fraction(0)
 
-    for i, ch in enumerate(s):
-        if ch in '12345678':
-            start = int(ch) - 1
-            start_pos = i
-            break
+    if '##' in content:
+        delay_text, duration_text = content.split('##', 1)
+        delay = sec_to_beat(delay_text, current_bpm)
+        duration = parse_time_value(duration_text, current_bpm)
+        return delay, duration
 
-    if start is None:
-        start = inherit_start
-        start_pos = -1
+    if '#' in content:
+        bpm_text, value_text = content.split('#', 1)
+        ref_bpm = Fraction(str(bpm_text))
 
-    if start is None:
-        return None, None
+        # 默认等待：指定 BPM 下的 1 拍
+        delay_seconds = Fraction(60, 1) / ref_bpm
+        delay = delay_seconds * Fraction(str(current_bpm)) / 60
 
-    seen_slide_symbol = False
-    end = None
+        duration = parse_time_value(content, current_bpm)
+        return delay, duration
 
-    for ch in s[start_pos + 1:]:
-        if ch in slide_symbols:
-            seen_slide_symbol = True
+    return Fraction(1), parse_time_value(content, current_bpm)
+
+
+def parse_slide_time(n, current_bpm):
+    """
+    保留原接口：从完整 SLIDE 字符串里取第一个 [...]。
+    """
+    if '[' not in n or ']' not in n:
+        return Fraction(1), Fraction(0)
+
+    content = n.split('[', 1)[1].split(']', 1)[0].strip()
+    return parse_slide_time_content(content, current_bpm)
+
+
+def parse_slide_duration_content(content, current_bpm):
+    """
+    只解析 duration，不解析等待时间。
+    用于连锁 SLIDE 的分段时长。
+    """
+    content = content.strip()
+
+    if '##' in content:
+        content = content.split('##', 1)[1]
+
+    return parse_time_value(content, current_bpm)
+
+
+def scan_slide_part(part):
+    """
+    扫描单条 SLIDE 轨道：
+    - 数字：按钮点
+    - [...]：时长参数
+    不使用正则，避免误读括号内数字。
+    """
+    cleaned = part.translate(str.maketrans('', '', 'xbf@$?!'))
+
+    digits = []
+    brackets = []
+
+    i = 0
+    while i < len(cleaned):
+        ch = cleaned[i]
+
+        if ch == '[':
+            j = cleaned.find(']', i + 1)
+            if j == -1:
+                break
+
+            brackets.append((i, j, cleaned[i + 1:j].strip()))
+            i = j + 1
             continue
 
-        if seen_slide_symbol and ch in '12345678':
-            end = int(ch) - 1
+        if ch in '12345678':
+            digits.append((i, int(ch) - 1))
 
-    return start, end
+        i += 1
+
+    has_slide_symbol = any(ch in slide_symbols for ch in cleaned)
+    return cleaned, digits, brackets, has_slide_symbol
 
 
-def make_slide_drag_points(startTime, start_k, end_k, delay, duration):
+def parse_slide_chain(part, default_start=None):
     """
-    从 start_k 到 end_k 生成固定间隔 drag 点。
+    把一条 SLIDE 解析成连续分段。
+
+    例：
+    1-4q7-2[1:2]
+      -> (1->4), (4->7), (7->2)
+
+    -6[8:5] 且 default_start=1
+      -> (1->6)
+      用于 Multiple SLIDE 的省略起点写法。
+    """
+    cleaned, digits, brackets, has_slide_symbol = scan_slide_part(part)
+
+    if not has_slide_symbol:
+        return [], []
+
+    if len(digits) >= 2:
+        points = digits[:]
+    elif len(digits) == 1 and default_start is not None:
+        points = [(-1, default_start), digits[0]]
+    else:
+        return [], []
+
+    buttons = [k for _, k in points]
+    segments = list(zip(buttons, buttons[1:]))
+
+    # 找每个分段终点后面有没有自己的 [...]
+    seg_brackets = []
+
+    for seg_i in range(len(segments)):
+        after_pos = points[seg_i + 1][0]
+        before_pos = points[seg_i + 2][0] if seg_i + 2 < len(points) else len(cleaned) + 1
+
+        content = None
+
+        for b_start, b_end, b_content in brackets:
+            if after_pos < b_start < before_pos:
+                content = b_content
+                break
+
+        seg_brackets.append(content)
+
+    return segments, seg_brackets
+
+
+def split_duration_by_x_distance(segments, total_duration):
+    """
+    没有逐段写时长时，把总时长分配给各段。
+
+    注意：你的 RPE 输出只用 positionX 模拟 slide，
+    所以这里按 X 距离近似分配；不还原 p/q/s/z/V/w 的真实几何轨迹长度。
+    """
+    if total_duration <= 0:
+        return [Fraction(0) for _ in segments]
+
+    weights = [
+        Fraction(str(round(abs(key[end_k] - key[start_k]), 6)))
+        for start_k, end_k in segments
+    ]
+
+    if not any(w > 0 for w in weights):
+        weights = [Fraction(1) for _ in segments]
+
+    total_weight = sum(weights, Fraction(0))
+
+    durations = []
+    used = Fraction(0)
+
+    for w in weights[:-1]:
+        d = total_duration * w / total_weight
+        durations.append(d)
+        used += d
+
+    durations.append(total_duration - used)
+    return durations
+
+
+def make_slide_segment_points(segment_start_time, start_k, end_k, duration, include_start=True):
+    """
+    生成单个分段的 drag 点。
     """
     notes = []
 
     if duration <= 0:
-        notes.append(drag(startTime + delay, start_k))
+        notes.append(drag(segment_start_time, start_k))
         return notes
 
     t = Fraction(0)
+
+    # 连锁第二段以后不要重复插入连接点
+    if not include_start:
+        t += SLIDE_STEP
 
     while t < duration:
         ratio = t / duration
 
         x = key[start_k] + (key[end_k] - key[start_k]) * float(ratio)
 
-        d = drag(startTime + delay + t, start_k)
+        d = drag(segment_start_time + t, start_k)
         d['positionX'] = x
         notes.append(d)
 
         t += SLIDE_STEP
 
-    # 保证终点一定有一个点
-    d = drag(startTime + delay + duration, end_k)
+    d = drag(segment_start_time + duration, end_k)
     d['positionX'] = key[end_k]
     notes.append(d)
 
     return notes
 
 
+def make_slide_chain_drag_points(startTime, segments, seg_brackets, current_bpm):
+    """
+    生成一条 SLIDE 轨道的 drag 点。
+    支持：
+    1-4q7-2[1:2]
+    1-4[2:1]q7[2:1]-2[1:1]
+    """
+    if not segments:
+        return []
+
+    # 每段都有自己的 [...]：使用逐段时长
+    if all(c is not None for c in seg_brackets):
+        delay, _ = parse_slide_time_content(seg_brackets[0], current_bpm)
+        durations = [
+            parse_slide_duration_content(c, current_bpm)
+            for c in seg_brackets
+        ]
+
+    # 只有最后一个 [...]：作为整条连锁 SLIDE 的总时长
+    else:
+        final_content = next((c for c in reversed(seg_brackets) if c is not None), None)
+
+        if final_content is None:
+            delay, total_duration = Fraction(1), Fraction(0)
+        else:
+            delay, total_duration = parse_slide_time_content(final_content, current_bpm)
+
+        durations = split_duration_by_x_distance(segments, total_duration)
+
+    notes = []
+    cursor = startTime + delay
+
+    for i, ((start_k, end_k), duration) in enumerate(zip(segments, durations)):
+        notes.extend(
+            make_slide_segment_points(
+                cursor,
+                start_k,
+                end_k,
+                duration,
+                include_start=(i == 0)
+            )
+        )
+        cursor += duration
+
+    return notes
+
+
 def simulate_slide(startTime, n, current_bpm):
     """
-    用 drag 模拟 simai slide。
-    支持 * 连接的复合 slide，例如：
-    8-3[8:1]*-5[8:1]
+    支持：
+    - 普通 SLIDE：1-5[8:1]
+    - Multiple SLIDE：1-4[4:3]*-6[8:5]
+    - 连锁 SLIDE：1-4q7-2[1:2]
+    - 连锁逐段时长：1-4[2:1]q7[2:1]-2[1:1]
     """
     notes = []
 
-    # slide 起点星星/起点 tap
+    cleaned_whole = n.translate(str.maketrans('', '', 'xbf@$'))
+
     first_digit = None
-    for ch in n:
+    for ch in cleaned_whole:
         if ch in '12345678':
             first_digit = int(ch) - 1
             break
 
-    if first_digit is not None:
+    # simai 的 ? / ! 是无星星 SLIDE
+    no_star_tap = '?' in n or '!' in n
+
+    if first_digit is not None and not no_star_tap:
         notes.append(tap(startTime, first_digit))
 
+    # * 是 Multiple SLIDE：每条轨道都从原始起点开始，不是从上一条终点开始
     parts = n.split('*')
-    inherit_start = first_digit
+    root_start = first_digit
 
     for part in parts:
         part = part.strip()
         if not part:
             continue
 
-        start_k, end_k = find_slide_start_end(part, inherit_start)
+        segments, seg_brackets = parse_slide_chain(part, root_start)
 
-        if start_k is None:
+        if not segments:
             continue
-
-        if end_k is None:
-            notes.append(drag(startTime, start_k))
-            inherit_start = start_k
-            continue
-
-        delay, duration = parse_slide_time(part, current_bpm)
 
         notes.extend(
-            make_slide_drag_points(startTime, start_k, end_k, delay, duration)
+            make_slide_chain_drag_points(
+                startTime,
+                segments,
+                seg_brackets,
+                current_bpm
+            )
         )
-
-        inherit_start = end_k
 
     return notes
 with open('maidata.txt','r',encoding='utf-8') as f: inChart = f.read()
@@ -474,7 +649,8 @@ for line in inChart.split('\n'):
         if char == ',':
             note = line[line.rfind(',',0,i)+1:i].split('}')[-1].split('/')
             for n in note:
-                n = n.translate(str.maketrans('', '', 'xbf@$?'))
+                raw_n = n.strip()
+                n = raw_n.translate(str.maketrans('', '', 'xbf@$?'))
                 if n.isdigit(): outChart['judgeLineList'][0]['notes'].append(tap(time,int(n)-1))
                 elif 'h' in n:
                     holdTime = n.split('[')[1].split(']')[0].split(':')
@@ -483,9 +659,9 @@ for line in inChart.split('\n'):
                 elif n and n[0] in 'ABCDE':
                     n = n.translate(str.maketrans('', '', 'ABCDE'))
                     outChart['judgeLineList'][0]['notes'].append(drag(time,int(n[0])-1))
-                elif any(c in n for c in slide_symbols):
+                elif any(c in raw_n for c in slide_symbols):
                     outChart['judgeLineList'][0]['notes'].extend(
-                        simulate_slide(time, n, current_bpm)
+                        simulate_slide(time, raw_n, current_bpm)
                     )
             time += Fraction(4, div)
 outChart['judgeLineList'][0]['numOfNotes'] = len(outChart['judgeLineList'][0]['notes'])
